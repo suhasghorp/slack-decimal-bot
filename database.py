@@ -64,6 +64,18 @@ class SQLServerConnection:
                 )
             """)
             
+            # Create ReminderLog table to track reminders sent to users
+            cursor.execute("""
+                IF NOT EXISTS (SELECT * FROM sys.tables WHERE name='ReminderLog')
+                CREATE TABLE ReminderLog (
+                    id INT PRIMARY KEY IDENTITY(1,1),
+                    slack_user_id NVARCHAR(50) NOT NULL,
+                    month_year NVARCHAR(20) NOT NULL,
+                    reminder_sent_at DATETIME DEFAULT GETUTCDATE(),
+                    FOREIGN KEY (slack_user_id) REFERENCES TargetUsers(slack_user_id)
+                )
+            """)
+            
             conn.close()
             logger.info("Database tables initialized successfully")
         except Exception as e:
@@ -71,7 +83,7 @@ class SQLServerConnection:
             raise
     
     def insert_submission(self, slack_user_id, submitted_value, month_year):
-        """Insert a new submission into the database"""
+        """Insert a new submission into the database and refresh status"""
         try:
             if not (MIN_DECIMAL <= submitted_value <= MAX_DECIMAL):
                 raise ValueError(f"Value {submitted_value} is outside valid range [{MIN_DECIMAL}, {MAX_DECIMAL}]")
@@ -86,6 +98,10 @@ class SQLServerConnection:
             
             conn.close()
             logger.info(f"Submission recorded: user={slack_user_id}, value={submitted_value}, month={month_year}")
+            
+            # Refresh submission status after inserting
+            self.update_submission_status(month_year, None)
+            
             return True
         except Exception as e:
             logger.error(f"Failed to insert submission: {e}")
@@ -139,7 +155,7 @@ class SQLServerConnection:
             raise
     
     def update_submission_status(self, month_year, total_required):
-        """Update submission status for a month"""
+        """Update submission status for a month (refresh received count)"""
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
@@ -152,6 +168,19 @@ class SQLServerConnection:
             """, (month_year,))
             
             total_received = cursor.fetchone()[0]
+            
+            # If total_required is None, fetch from existing record; else use provided value
+            if total_required is None:
+                cursor.execute("""
+                    SELECT total_required FROM SubmissionStatus WHERE month_year = ?
+                """, (month_year,))
+                row = cursor.fetchone()
+                if row:
+                    total_required = row[0]
+                else:
+                    logger.warning(f"No SubmissionStatus found for {month_year}, cannot update total_received")
+                    conn.close()
+                    return False
             
             # Update or insert status
             cursor.execute("""
@@ -227,6 +256,67 @@ class SQLServerConnection:
             return None
         except Exception as e:
             logger.error(f"Failed to get submission status: {e}")
+            raise
+    
+    def log_reminder(self, slack_user_id, month_year):
+        """Log that a reminder was sent to a user for a month"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                INSERT INTO ReminderLog (slack_user_id, month_year)
+                VALUES (?, ?)
+            """, (slack_user_id, month_year))
+            
+            conn.close()
+            logger.info(f"Reminder logged for user {slack_user_id}, month {month_year}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to log reminder: {e}")
+            raise
+    
+    def get_last_reminder_date(self, slack_user_id, month_year):
+        """Get the most recent reminder sent to a user for a month"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT TOP 1 reminder_sent_at
+                FROM ReminderLog
+                WHERE slack_user_id = ? AND month_year = ?
+                ORDER BY reminder_sent_at DESC
+            """, (slack_user_id, month_year))
+            
+            row = cursor.fetchone()
+            conn.close()
+            
+            if row:
+                return row[0]
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get last reminder date: {e}")
+            raise
+    
+    def get_reminder_count(self, slack_user_id, month_year):
+        """Get how many reminders have been sent to a user for a month"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM ReminderLog
+                WHERE slack_user_id = ? AND month_year = ?
+            """, (slack_user_id, month_year))
+            
+            count = cursor.fetchone()[0]
+            conn.close()
+            
+            return count
+        except Exception as e:
+            logger.error(f"Failed to get reminder count: {e}")
             raise
 
 

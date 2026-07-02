@@ -16,7 +16,7 @@ A production-ready **Slack bot for monthly decimal submissions to SQL Server** h
 | **config.py** | Configuration management | Loads .env variables; validates config; sets up logging |
 | **database.py** | SQL Server CRUD operations | Connection pooling; auto-table creation; submission queries |
 | **handlers.py** | Slack event handlers | Button clicks, modal submissions, inline validation |
-| **scheduler.py** | APScheduler monthly trigger | Cron-based monthly submission request; posts channel message |
+| **scheduler.py** | APScheduler monthly trigger + reminders | Cron-based monthly submission request; daily reminder check for pending users |
 | **health.py** | Flask health monitoring | `/health` endpoint on port 5000 for external monitoring |
 | **run_bot.bat** | Windows batch launcher | Script for Task Scheduler; auto-restarts on failure |
 
@@ -43,7 +43,7 @@ A production-ready **Slack bot for monthly decimal submissions to SQL Server** h
 | **SETUP_GUIDE.md** | Step-by-step setup instructions for deployment |
 | **QUICK_REFERENCE.md** | Quick command reference and troubleshooting checklist |
 | **ARCHITECTURE.md** | System design, data flows, error handling strategy |
-| **.gitignore** | Git ignore rules for version control |
+| **REMINDER_SYSTEM.md** | Gentle reminder system design and implementation details |
 
 ---
 
@@ -57,14 +57,16 @@ A production-ready **Slack bot for monthly decimal submissions to SQL Server** h
 │  ┌─────────────────────────────────────────────────┐   │
 │  │ Python Slack Bot (app.py)                       │   │
 │  │ ├─ Slack Bolt App (Socket Mode)                │   │
-│  │ ├─ APScheduler (monthly trigger)                │   │
+│  │ ├─ APScheduler:                                │   │
+│  │ │  ├─ Monthly trigger (1st of month)           │   │
+│  │ │  └─ Reminder checker (weekdays at 10 AM)     │   │
 │  │ ├─ Event Handlers (buttons, modals)             │   │
 │  │ └─ Event Logging                                │   │
 │  └┬────────────────────────────────────────────────┘   │
 │   │                                                     │
 │   ├─ SQL Server (Database)                            │
 │   │  └─ Tables: TargetUsers, MonthlySubmissions,      │
-│   │            SubmissionStatus                       │
+│   │            SubmissionStatus, ReminderLog          │
 │   │                                                    │
 │   ├─ Flask Health Endpoint (port 5000)               │
 │   │  └─ Monitoring via /health                       │
@@ -73,12 +75,12 @@ A production-ready **Slack bot for monthly decimal submissions to SQL Server** h
 │      └─ Audit trail + debugging                       │
 │                                                        │
 └─────────────────────────────────────────────────────────┘
-           │                      │
-           ▼ (HTTPS)              ▼ (HTTP monitoring)
-      Slack Cloud            External Monitoring
-     - chat_postMessage      - Health checks
-     - views_open            - Status dashboard
-     - auth_test
+            │                      │
+            ▼ (HTTPS)              ▼ (HTTP monitoring)
+       Slack Cloud            External Monitoring
+      - chat_postMessage      - Health checks
+      - views_open            - Status dashboard
+      - auth_test
 ```
 
 ---
@@ -131,6 +133,7 @@ python app.py
 - [x] Ability to resubmit and update submissions
 - [x] Confirmation messages after successful submission
 - [x] Status check button to see who has submitted
+- [x] Automated reminders for non-submitters (every 5 weekdays)
 
 ### ✅ Admin/Operational Features
 - [x] SQL Server integration with auto-table creation
@@ -186,7 +189,7 @@ SUBMISSION_DEADLINE_DAYS=10
 
 ## 📊 Database Schema
 
-Three SQL Server tables auto-created on startup:
+Four SQL Server tables auto-created on startup:
 
 ### TargetUsers
 ```sql
@@ -202,6 +205,13 @@ id (PK) | slack_user_id (FK) | submitted_value | submission_date | month_year
 ```sql
 month_year (PK) | total_required | total_received | submission_deadline | created_at | last_updated
 ```
+
+### ReminderLog (NEW)
+```sql
+id (PK) | slack_user_id (FK) | month_year | reminder_sent_at
+```
+Tracks every reminder sent to users for reminder deduplication and auditing.
+
 
 ---
 
@@ -312,7 +322,36 @@ User receives confirmation DM:
 
 ---
 
-## 🎯 Next Steps
+## 📧 NEW: Gentle Reminder System
+
+**What's New?** The bot now automatically reminds non-submitters every 5 weekdays until they submit.
+
+### How It Works
+- **First Reminder**: Sent after 5 weekdays if user hasn't submitted
+- **Subsequent Reminders**: Sent every 5 weekdays thereafter
+- **Schedule**: Runs on weekdays (Mon-Fri) at 10:00 UTC
+- **Tracking**: All reminders logged in `ReminderLog` table to prevent spam
+- **Smart**: Uses business days only (excludes weekends)
+
+### What Changed
+1. **Database**: New `ReminderLog` table tracks reminders sent
+2. **Database**: `insert_submission()` now refreshes `total_received` count immediately
+3. **Scheduler**: New daily job `check_and_send_reminders()` runs on weekdays
+4. **Functions**: New helper `count_weekdays()` for business day calculations
+
+### Example Timeline
+```
+July 1 (Wed)     → Monthly job triggers, posts submission message
+July 3 (Fri)     → 2 weekdays elapsed, no reminder yet
+July 10 (Fri)    → 7 weekdays elapsed, SEND REMINDER #1 to pending users
+July 17 (Fri)    → 5 weekdays since reminder, SEND REMINDER #2 to still-pending users
+July 24 (Fri)    → 5 weekdays since reminder, SEND REMINDER #3...
+(continues until all users submit)
+```
+
+For details, see: **REMINDER_SYSTEM.md**
+
+---
 
 1. **Local Testing** (15 min)
    - Run `python test_config.py`
@@ -341,16 +380,18 @@ slack-decimal-bot/
 ├── Core Application
 │   ├── app.py                    (563 lines)
 │   ├── config.py                 (120 lines)
-│   ├── database.py               (320 lines)
+│   ├── database.py               (386 lines +++ NEW: ReminderLog methods)
 │   ├── handlers.py               (330 lines)
-│   ├── scheduler.py              (150 lines)
+│   ├── scheduler.py              (227 lines +++ NEW: Reminder job)
 │   ├── health.py                 (120 lines)
 │   └── run_bot.bat               (25 lines)
 │
 ├── Utilities
 │   ├── test_config.py            (380 lines)
 │   ├── db_utility.py             (450 lines)
-│   └── sqlserver_utils.py        (380 lines)
+│   ├── sqlserver_utils.py        (380 lines)
+│   ├── test_reminders_simple.py  (269 lines *** NEW ***)
+│   └── test_reminders.py         (225 lines *** NEW ***)
 │
 ├── Configuration
 │   ├── requirements.txt           (7 packages)
@@ -362,6 +403,7 @@ slack-decimal-bot/
 │   ├── SETUP_GUIDE.md            (600+ lines)
 │   ├── QUICK_REFERENCE.md        (450+ lines)
 │   ├── ARCHITECTURE.md           (550+ lines)
+│   ├── REMINDER_SYSTEM.md        (400+ lines *** NEW ***)
 │   └── THIS FILE (SUMMARY)
 │
 └── Workspace
@@ -370,8 +412,8 @@ slack-decimal-bot/
     └── venv/                      (Created via python -m venv venv)
 ```
 
-**Total Code**: ~2500 lines
-**Total Documentation**: ~2500+ lines
+**Total Code**: ~2600+ lines (includes new reminder system)
+**Total Documentation**: ~2900+ lines (includes REMINDER_SYSTEM.md)
 
 ---
 
@@ -420,6 +462,7 @@ Refer to the documentation files:
 - **Quick command reminder?** → QUICK_REFERENCE.md
 - **Full details?** → README.md
 - **Troubleshooting?** → QUICK_REFERENCE.md (Troubleshooting section)
+- **How do reminders work?** → REMINDER_SYSTEM.md
 
 ---
 
